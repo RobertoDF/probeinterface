@@ -800,15 +800,17 @@ def read_spikegadgets(file: str | Path, raise_error: bool = True) -> ProbeGroup:
             electrode_id = ntrode.attrib["id"]
             if int(ntrode.attrib["id"][0]) == curr_probe:
                 chan_data = ntrode[0].attrib
-                channel_data.append({
-                    "hw": int(chan_data["hwChan"]),
-                    "col": int(chan_data["probeColumn"]),
-                    "ap": int(chan_data["coord_ap"]),
-                    "ml": int(chan_data["coord_ml"]),
-                    "dv": int(chan_data["coord_dv"]),
-                    "probe_n": int(electrode_id[0]),
-                    "channel": int(electrode_id[1:])
-                })
+                channel_data.append(
+                    {
+                        "hw": int(chan_data["hwChan"]),
+                        "col": int(chan_data["probeColumn"]),
+                        "ap": int(chan_data["coord_ap"]),
+                        "ml": int(chan_data["coord_ml"]),
+                        "dv": int(chan_data["coord_dv"]),
+                        "probe_n": int(electrode_id[0]),
+                        "channel": int(electrode_id[1:]),
+                    }
+                )
 
         # 2. Extract indices
 
@@ -821,7 +823,8 @@ def read_spikegadgets(file: str | Path, raise_error: bool = True) -> ProbeGroup:
         dv_col = contact_positions[:, 1]  # assume dv is the second column
         sorted_order = np.argsort(dv_col)  # indices that sort by dv ascending
         device_channels = sorted_order[
-            device_channels]  # the ids in trodes are assigned according to a dv sorted probe, we have to check which ml direction though!
+            device_channels
+        ]  # the ids in trodes are assigned according to a dv sorted probe, we have to check which ml direction though!
 
         probe = full_probe.get_slice(device_channels)
         probe.set_device_channel_indices(active_channels)
