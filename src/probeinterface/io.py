@@ -772,7 +772,7 @@ def read_spikegadgets(file: str | Path, raise_error: bool = True) -> ProbeGroup:
         if raise_error:
             raise Exception("No supported Neuropixels probes found")
         return None
-         
+
     probe_group = ProbeGroup()
 
     for curr_probe_idx, probe_config in enumerate(probe_configs):
