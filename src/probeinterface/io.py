@@ -817,12 +817,11 @@ def read_spikegadgets(file: str | Path, raise_error: bool = True) -> ProbeGroup:
 
         full_probe = build_neuropixels_probe(part_number)
 
-        full_probe_df = pd.concat([pd.DataFrame(full_probe.contact_positions, columns=["ml", "dv"]),
-                                   pd.Series(full_probe.contact_ids, name="contact_ids")], axis=1).sort_values(
-            ["dv"]).reset_index(drop=True)
-
-        device_channels = pd.DataFrame(full_probe.contact_positions, columns=["ml", "dv"]).sort_values(["dv"]).iloc[
-            device_channels].index # the ids in trodes are assigned according to a dv sorted probe
+        contact_positions = full_probe.contact_positions  # shape (n_contacts, 2)
+        dv_col = contact_positions[:, 1]  # assume dv is the second column
+        sorted_order = np.argsort(dv_col)  # indices that sort by dv ascending
+        device_channels = sorted_order[
+            device_channels]  # the ids in trodes are assigned according to a dv sorted probe, we have to check which ml direction though!
 
         probe = full_probe.get_slice(device_channels)
         probe.set_device_channel_indices(active_channels)
