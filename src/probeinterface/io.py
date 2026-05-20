@@ -809,25 +809,26 @@ def read_spikegadgets(file: str | Path, raise_error: bool = True) -> ProbeGroup:
                         "ml": int(chan_data["coord_ml"]),
                         "dv": int(chan_data["coord_dv"]),
                         "probe_n": int(electrode_id[0]),
-                        "channel": int(electrode_id[1:]),
+                        "channel": int(electrode_id[1:])-1 # trodes channels start at 1 not 0
                     }
                 )
 
         # 2. Extract indices
 
-        device_channels = np.array([c["channel"] for c in channel_data])
+        device_channels = np.array([c["channel"] for c in channel_data]) - 1 # channel ids start at 1 
         active_channels = np.array([c["hw"] for c in channel_data])
 
         full_probe = build_neuropixels_probe(part_number)
 
         contact_positions = full_probe.contact_positions  # shape (n_contacts, 2)
-        dv_col = contact_positions[:, 1]  # assume dv is the second column
-        sorted_order = np.argsort(dv_col)  # indices that sort by dv ascending
-        device_channels = sorted_order[
-            device_channels
-        ]  # the ids in trodes are assigned according to a dv sorted probe, we have to check which ml direction though!
-
-        probe = full_probe.get_slice(device_channels)
+        ml = contact_positions[:, 0] 
+        dv = contact_positions[:, 1]  
+        
+        sorted_order = np.lexsort((-ml, dv))   
+        device_channels_indexes = sorted_order[
+            device_channels]  # the ids in trodes are assigned according to whats seen in trodes, id 0 is tip of the probe (min dv) and max ml.
+    
+        probe = full_probe.get_slice(device_channels_indexes)
         probe.set_device_channel_indices(active_channels)
 
         probe.model_name = ""
