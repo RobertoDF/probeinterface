@@ -734,64 +734,121 @@ def write_csv(file, probe):
 
 
 def read_spikegadgets(file: str | Path, raise_error: bool = True) -> ProbeGroup:
-    PROBE_SPECS = {
-        "NeuroPixels1": {"width": 12, "height": 12},
-        "NeuroPixels2": {"width": 12, "height": 12}
-    }
+    """
+    Find active channels of the given Neuropixels probe from a SpikeGadgets .rec file.
+    SpikeGadgets headstages support up to three Neuropixels 1.0 probes (as of March 28, 2024),
+    and information for all probes will be returned in a ProbeGroup object.
+
+
+    Parameters
+    ----------
+    file : Path or str
+        The .rec file path
+
+    Returns
+    -------
+    probe_group : ProbeGroup object
+
+    """
+    # The SpikeGadgets .rec XML does not include a probe part number. The NP1.0
+    # catalogue variants (NP1000, NP1001, PRB_1_2_0480_2, PRB_1_4_0480_1,
+    # PRB_1_4_0480_1_C) share identical 2D geometry in the probeinterface
+    # catalogue (contact positions, pitch, stagger, shank width), differing only
+    # in metadata that probeinterface does not consume (ADC resolution, databus
+    # phase, gain, on-shank reference, shank thickness). So hardcoding NP1000
+    # produces correct geometry; `model_name` and `description` are cleared on
+    # the sliced probe to avoid claiming a specific variant.
 
     header_txt = parse_spikegadgets_header(file)
     root = ElementTree.fromstring(header_txt)
     hconf = root.find("HardwareConfiguration")
     sconf = root.find("SpikeConfiguration")
 
-    probe_devices = [d for d in hconf if d.attrib.get("name") in PROBE_SPECS.keys()]
+    # Detect devices present in the header
+    probe_configs = [d for d in hconf if d.attrib.get("name") in ["NeuroPixels1", "NeuroPixels2"]]
+    n_probes = len(probe_configs)
 
-    # Group by probe ID
-    probes_dict = {}
-    for ntrode in sconf:
-        ch_info = ntrode.find("SpikeChannel")
-        if ch_info is None: continue
-        probe_id = int(ntrode.attrib["id"][0])
-        if probe_id not in probes_dict:
-            probes_dict[probe_id] = []
-        probes_dict[probe_id].append((ntrode.attrib["id"], ch_info))
-
-    # --- Print Summary Information ---
-    print(f"Number of probes detected: {len(probes_dict)}")
-    for pid in sorted(probes_dict.keys()):
-        print(f"Probe {pid}: {len(probes_dict[pid])} active channels")
-    print(f"Total active channels: {sum(len(ch) for ch in probes_dict.values())}")
+    if n_probes == 0:
+        if raise_error:
+            raise Exception("No supported Neuropixels probes found")
 
     probe_group = ProbeGroup()
 
-    for probe_id in sorted(probes_dict.keys()):
-        data = probes_dict[probe_id]
+    for curr_probe_idx, probe_config in enumerate(probe_configs):
 
-        device_name = probe_devices[probe_id - 1].attrib["name"]
-        print(f"Processing Probe {probe_id} identified as: {device_name}")
+        device_name = probe_config.attrib["name"]
 
-        if device_name not in PROBE_SPECS:
-            raise ValueError(f"Unknown probe type: {device_name}.")
+        # 1. Collect all used probeColumns for this probe index, this is needed to understand how many shanks are present
+        curr_probe = curr_probe_idx + 1
+        used_columns = set()
+        for ntrode in sconf:
+            if int(ntrode.attrib["id"][0]) == curr_probe:
+                # Assuming SpikeChannel follows the structure where probeColumn is defined
+                for channel in ntrode.findall("SpikeChannel"):
+                    used_columns.add(int(channel.attrib["probeColumn"]))
 
-        specs = PROBE_SPECS[device_name]
+        # 2. Determine part number based on shank count
+        if device_name == "NeuroPixels1":
+            part_number = "NP1000"
+        elif device_name == "NeuroPixels2":
+            # NP2.0: 1 shank = columns 0-1; 4 shanks = columns 0-7
+            num_shanks = 4 if max(used_columns) == 7 else 1
+            part_number = "NP2000" if num_shanks == 1 else "NP2010"
 
-        contact_ids = [item[0] for item in data]
-        device_channels = [item[1].attrib["hwChan"] for item in data]
+        channel_data = []
+        for ntrode in sconf:
+            electrode_id = ntrode.attrib["id"]
+            if int(ntrode.attrib["id"][0]) == curr_probe:
+                chan_data = ntrode[0].attrib
+                channel_data.append({
+                    "hw": int(chan_data["hwChan"]),
+                    "col": int(chan_data["probeColumn"]),
+                    "ap": int(chan_data["coord_ap"]),
+                    "ml": int(chan_data["coord_ml"]),
+                    "dv": int(chan_data["coord_dv"]),
+                    "probe_n": int(electrode_id[0]),
+                    "channel": int(electrode_id[1:])
+                })
 
-        positions = np.zeros((len(data), 2))
-        for i, (_, ch_info) in enumerate(data):
-            positions[i, 0] = float(ch_info.attrib["coord_ml"])
-            positions[i, 1] = float(ch_info.attrib["coord_dv"])
+        # 2. Extract indices
 
-        probe = Probe(ndim=2, si_units="um", model_name=device_name, manufacturer="IMEC")
-        probe.set_contacts(
-            contact_ids=contact_ids, positions=positions, shapes="square",
-            shape_params={"width": specs["width"], "height": specs["height"]},
-        )
-        probe.set_device_channel_indices(device_channels)
+        device_channels = np.array([c["channel"] for c in channel_data])
+        active_channels = np.array([c["hw"] for c in channel_data])
 
-        #
-        probe.move([250 * (probe_id - 1), 0])
+        full_probe = build_neuropixels_probe(part_number)
+
+        full_probe_df = pd.concat([pd.DataFrame(full_probe.contact_positions, columns=["ml", "dv"]),
+                                   pd.Series(full_probe.contact_ids, name="contact_ids")], axis=1).sort_values(
+            ["dv"]).reset_index(drop=True)
+
+        device_channels = pd.DataFrame(full_probe.contact_positions, columns=["ml", "dv"]).sort_values(["dv"]).iloc[
+            device_channels].index # the ids in trodes are assigned according to a dv sorted probe
+
+        probe = full_probe.get_slice(device_channels)
+        probe.set_device_channel_indices(active_channels)
+
+        probe.model_name = ""
+        probe.description = ""
+
+        # Annotate ADC info
+        adc_sampling_table = probe.annotations.get("adc_sampling_table")
+        if adc_sampling_table is not None:
+            _annotate_probe_with_adc_sampling_info(probe, adc_sampling_table)
+
+        # Handle gain settings dynamically
+        source_options_blocks = [s for s in hconf.findall("SourceOptions") if s.attrib.get("name") == device_name]
+        if curr_probe_idx < len(source_options_blocks):
+            custom_options = {
+                opt.attrib["name"]: opt.attrib["data"].strip()
+                for opt in source_options_blocks[curr_probe_idx].findall("CustomOption")
+            }
+            if "APGainMode" in custom_options:
+                probe.annotate(ap_gain=float(custom_options["APGainMode"]))
+            if probe.annotations.get("lf_sample_frequency_hz", 0) > 0 and "LFPGainMode" in custom_options:
+                probe.annotate(lf_gain=float(custom_options["LFPGainMode"]))
+
+        # Spatial shift for multiple probes
+        probe.move([250 * curr_probe_idx, 0])
         probe_group.add_probe(probe)
 
     return probe_group
