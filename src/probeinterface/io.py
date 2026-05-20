@@ -734,101 +734,64 @@ def write_csv(file, probe):
 
 
 def read_spikegadgets(file: str | Path, raise_error: bool = True) -> ProbeGroup:
-    """
-    Find active channels of the given Neuropixels probe from a SpikeGadgets .rec file.
-    SpikeGadgets headstages support up to three Neuropixels 1.0 probes (as of March 28, 2024),
-    and information for all probes will be returned in a ProbeGroup object.
-
-
-    Parameters
-    ----------
-    file : Path or str
-        The .rec file path
-
-    Returns
-    -------
-    probe_group : ProbeGroup object
-
-    """
-    # The SpikeGadgets .rec XML does not include a probe part number. The NP1.0
-    # catalogue variants (NP1000, NP1001, PRB_1_2_0480_2, PRB_1_4_0480_1,
-    # PRB_1_4_0480_1_C) share identical 2D geometry in the probeinterface
-    # catalogue (contact positions, pitch, stagger, shank width), differing only
-    # in metadata that probeinterface does not consume (ADC resolution, databus
-    # phase, gain, on-shank reference, shank thickness). So hardcoding NP1000
-    # produces correct geometry; `model_name` and `description` are cleared on
-    # the sliced probe to avoid claiming a specific variant.
-    PART_NUMBER = "NP1000"
+    PROBE_SPECS = {
+        "NeuroPixels1": {"width": 12, "height": 12},
+        "NeuroPixels2": {"width": 12, "height": 12}
+    }
 
     header_txt = parse_spikegadgets_header(file)
     root = ElementTree.fromstring(header_txt)
     hconf = root.find("HardwareConfiguration")
     sconf = root.find("SpikeConfiguration")
 
-    probe_configs = [d for d in hconf if d.attrib.get("name") == "NeuroPixels1"]
-    n_probes = len(probe_configs)
+    probe_devices = [d for d in hconf if d.attrib.get("name") in PROBE_SPECS.keys()]
 
-    if n_probes == 0:
-        if raise_error:
-            raise Exception("No Neuropixels 1.0 probes found")
-        return None
+    # Group by probe ID
+    probes_dict = {}
+    for ntrode in sconf:
+        ch_info = ntrode.find("SpikeChannel")
+        if ch_info is None: continue
+        probe_id = int(ntrode.attrib["id"][0])
+        if probe_id not in probes_dict:
+            probes_dict[probe_id] = []
+        probes_dict[probe_id].append((ntrode.attrib["id"], ch_info))
 
-    # NeuroPixels1 SourceOptions blocks carry the per-probe AP/LF gain settings.
-    # They appear in the same order as the SpikeNTrode probe digits (1, 2, 3).
-    source_options_blocks = [s for s in hconf.findall("SourceOptions") if s.attrib.get("name") == "NeuroPixels1"]
+    # --- Print Summary Information ---
+    print(f"Number of probes detected: {len(probes_dict)}")
+    for pid in sorted(probes_dict.keys()):
+        print(f"Probe {pid}: {len(probes_dict[pid])} active channels")
+    print(f"Total active channels: {sum(len(ch) for ch in probes_dict.values())}")
 
     probe_group = ProbeGroup()
 
-    for curr_probe in range(1, n_probes + 1):
-        # SpikeNTrode elements are the authoritative list of recorded electrodes.
-        # Each id is "<probe_digit><1-based electrode number>" for up to 960
-        # electrodes on NP1.0; the catalogue uses 0-based indices, so
-        # catalogue_index = electrode_number - 1. The probe number is assumed
-        # to be a single digit (1, 2, or 3), matching the documented
-        # SpikeGadgets limit of three simultaneous Neuropixels probes.
-        electrode_to_hwchan = {}
-        for ntrode in sconf:
-            electrode_id = ntrode.attrib["id"]
-            if int(electrode_id[0]) == curr_probe:
-                catalogue_index = int(electrode_id[1:]) - 1
-                hw_chan = int(ntrode[0].attrib["hwChan"])
-                electrode_to_hwchan[catalogue_index] = hw_chan
+    for probe_id in sorted(probes_dict.keys()):
+        data = probes_dict[probe_id]
 
-        active_indices = np.array(sorted(electrode_to_hwchan.keys()))
+        device_name = probe_devices[probe_id - 1].attrib["name"]
+        print(f"Processing Probe {probe_id} identified as: {device_name}")
 
-        full_probe = build_neuropixels_probe(PART_NUMBER)
-        probe = full_probe.get_slice(active_indices)
+        if device_name not in PROBE_SPECS:
+            raise ValueError(f"Unknown probe type: {device_name}.")
 
-        # Clear part-number-specific metadata since we don't know the actual part number.
-        probe.model_name = ""
-        probe.description = ""
+        specs = PROBE_SPECS[device_name]
 
-        device_channels = np.array([electrode_to_hwchan[idx] for idx in active_indices])
+        contact_ids = [item[0] for item in data]
+        device_channels = [item[1].attrib["hwChan"] for item in data]
+
+        positions = np.zeros((len(data), 2))
+        for i, (_, ch_info) in enumerate(data):
+            positions[i, 0] = float(ch_info.attrib["coord_ml"])
+            positions[i, 1] = float(ch_info.attrib["coord_dv"])
+
+        probe = Probe(ndim=2, si_units="um", model_name=device_name, manufacturer="IMEC")
+        probe.set_contacts(
+            contact_ids=contact_ids, positions=positions, shapes="square",
+            shape_params={"width": specs["width"], "height": specs["height"]},
+        )
         probe.set_device_channel_indices(device_channels)
 
-        # Per-contact ADC group and sample order from the catalogue MUX table plus
-        # the hwChan mapping (which is the readout-channel index for each contact).
-        adc_sampling_table = probe.annotations.get("adc_sampling_table")
-        _annotate_probe_with_adc_sampling_info(probe, adc_sampling_table)
-
-        # NP1.0 gain is programmable. Read APGainMode and LFPGainMode from the
-        # SourceOptions block matching this probe (blocks appear in probe order).
-        if "ap_gain" not in probe.annotations and curr_probe - 1 < len(source_options_blocks):
-            custom_options = {
-                opt.attrib["name"]: opt.attrib["data"].strip()
-                for opt in source_options_blocks[curr_probe - 1].findall("CustomOption")
-            }
-            ap_gain_str = custom_options.get("APGainMode")
-            if ap_gain_str:
-                probe.annotate(ap_gain=float(ap_gain_str))
-            if probe.annotations.get("lf_sample_frequency_hz", 0) > 0:
-                lf_gain_str = custom_options.get("LFPGainMode")
-                if lf_gain_str:
-                    probe.annotate(lf_gain=float(lf_gain_str))
-
-        # Shift multiple probes so they don't overlap when plotted
-        probe.move([250 * (curr_probe - 1), 0])
-
+        #
+        probe.move([250 * (probe_id - 1), 0])
         probe_group.add_probe(probe)
 
     return probe_group
